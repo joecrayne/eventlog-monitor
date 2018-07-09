@@ -15,12 +15,18 @@ import GHC.RTS.Events                 as Events
 import GHC.RTS.Events.Incremental
 import System.Environment
 import System.IO
+import System.IO.Unsafe (unsafeInterleaveIO)
 import Text.Printf
 
+import BS
+
 data EventsMonitor = EventsMonitor
-    { emThreadLabels :: Map.Map String ThreadId
-    , emThreadCounts :: OrdPSQ ThreadId TPrio ThreadCounts
-    , emThreshold    :: TPrio
+    { emThreadLabels   :: Map.Map String ThreadId
+    , emThreadCounts   :: OrdPSQ ThreadId TPrio ThreadCounts
+    , emThreshold      :: TPrio
+    , emMaxRunning     :: Int
+    , emMinRunning     :: Int
+    , emCurrentRunning :: Int
     }
  deriving Show
 
@@ -35,7 +41,14 @@ data ThreadCounts = ThreadCounts
  deriving (Eq,Ord,Show)
 
 newEventsMonitor :: EventsMonitor
-newEventsMonitor = EventsMonitor Map.empty OrdPSQ.empty tprioMax
+newEventsMonitor = EventsMonitor
+    { emThreadLabels   = Map.empty
+    , emThreadCounts   = OrdPSQ.empty
+    , emThreshold      = tprioMax
+    , emMaxRunning     = 0
+    , emMinRunning     = 0
+    , emCurrentRunning = 0
+    }
 
 initCounts :: Events.Timestamp -> (TPrio, ThreadCounts)
 initCounts tm = (tprio t0, t0)
@@ -48,6 +61,22 @@ initCounts tm = (tprio t0, t0)
         , tLabel        = ""
         }
 
+data ThreadPriority prio = ThreadPriority
+    { tpMaxPriority :: prio
+    , tpPrio        :: ThreadCounts -> prio
+    }
+
+ratioPriority :: ThreadPriority (Ratio Word64)
+ratioPriority = ThreadPriority
+    { tpMaxPriority = maxBound % 1
+    , tpPrio = \counts -> case tLabel counts of
+        "" -> maxBound % 1
+        _  -> (tot + 1 - tTicksRunning counts) % (tot + 1)
+         where
+            tot = tCurrentTime counts - tStartTime counts
+    }
+
+{-
 type TPrio = Ratio Word64
 
 tprioMax :: TPrio
@@ -59,6 +88,17 @@ tprio counts = case tLabel counts of
     _  -> (tot + 1 - tTicksRunning counts) % (tot + 1)
  where
     tot = tCurrentTime counts - tStartTime counts
+-}
+
+type TPrio = (Word64,Down Word64)
+
+tprioMax :: TPrio
+tprioMax = (maxBound,Down 0)
+
+tprio :: ThreadCounts -> TPrio
+tprio counts = ( if tIsRunning counts then 0 else maxBound - (tCurrentTime counts `div` (maxBound `div` 100))
+               , Down $ tTicksRunning counts)
+
 
 setRunning :: Events.Timestamp -> Bool -> Maybe (TPrio, ThreadCounts) -> Maybe (TPrio, ThreadCounts)
 setRunning tm isRunning Nothing           = setRunning tm isRunning (Just $ initCounts tm)
@@ -111,16 +151,21 @@ listByPrio q = case OrdPSQ.minView q of
 --  AssignThreadToProcess
 --  MerReleaseThread
 --
--- updateCounts :: Event -> EventsMonitor -> (EventsMonitor, Maybe ThreadCounts)
 updateCounts :: TPrio
                 -> Event
                 -> Maybe (Maybe (TPrio, ThreadCounts) -> Maybe (TPrio, ThreadCounts), ThreadId)
 updateCounts thrsh Event{ evTime, evSpec = RunThread    tid                } = Just (setRunning  evTime True , tid)
 updateCounts thrsh Event{ evTime, evSpec = StopThread   tid ThreadFinished } = Just (setFinished evTime thrsh, tid)
 updateCounts thrsh Event{ evTime, evSpec = StopThread   tid stopStat       } = Just (setRunning  evTime False, tid)
-updateCounts thrsh Event{ evTime, evSpec = WakeupThread tid otherCap       } = Just (setRunning  evTime True , tid)
+updateCounts thrsh Event{ evTime, evSpec = WakeupThread tid otherCap       } = Nothing -- Just (setRunning  evTime True , tid)
 updateCounts thrsh Event{ evTime, evSpec = ThreadLabel  tid lbl            } = Just (setLabel lbl            , tid)
 updateCounts thrsh Event{                                                  } = Nothing
+
+isRunning :: Event -> Maybe Bool
+isRunning Event{evSpec = WakeupThread _ _} = Nothing -- Just True
+isRunning Event{evSpec = StopThread   _ _} = Just False
+isRunning Event{evSpec = RunThread    _  } = Just True
+isRunning Event{}                          = Nothing
 
 update :: Event -> EventsMonitor -> (EventsMonitor,Bool)
 update ev m
@@ -132,11 +177,25 @@ update ev m
     | otherwise
         = (m, False)
 
+updateRunningCount :: Event -> EventsMonitor -> EventsMonitor
+updateRunningCount ev m
+    | Just True  <- isRunning ev
+                = m { emMaxRunning     = if max == cnt then cnt + 1 else max
+                    , emCurrentRunning = cnt + 1 }
+    | Just False <- isRunning ev
+                = m { emMinRunning     = if min == cnt then cnt - 1 else min
+                    , emCurrentRunning = cnt - 1 }
+    | otherwise = m
+ where
+    min = emMinRunning m
+    max = emMaxRunning m
+    cnt = emCurrentRunning m
+
 showCounts :: PrintfArg t => (t, b, ThreadCounts) -> String
 showCounts (tid,p,counts) = unwords
     [ printf "%6d" tid
-    , printf "%12d" (tTicksRunning counts)
-    , printf "%12d" (tTicksWaiting counts)
+    , printf "%13d" (tTicksRunning counts)
+    , printf "%13d" (tTicksWaiting counts)
     , tLabel counts
     ]
 
@@ -157,7 +216,7 @@ clearLineCode   = csi [2] "K"
 
 displayReport :: EventsMonitor -> IO TPrio
 displayReport m = do
-    putStrLn $ homeCursorCode ++ "-------------"
+    putStrLn $ homeCursorCode ++ "-------------" ++ show (emMinRunning m, emMaxRunning m, emCurrentRunning m)
     foldM (\_ t -> do putStrLn $ clearLineCode ++ showCounts t
                       let (_,thresh,_) = t
                       return thresh)
@@ -166,8 +225,7 @@ displayReport m = do
 
 updateIO :: EventsMonitor -> Event -> IO EventsMonitor
 updateIO m ev = do
-    let (m',b) = update ev m
-    reverse (show ev) `seq` return () -- Force all event data.
+    let (m',b) = update ev $ updateRunningCount ev m
     if b then do
         thresh <- displayReport m'
         return m' { emThreshold = thresh }
@@ -185,5 +243,7 @@ main :: IO ()
 main = do
     args <- getArgs
     let [fname] = args
-    bs <- L.readFile fname
+    h <- openFile fname ReadMode
+    -- hSetBuffering h NoBuffering
+    bs <- hGetContentsN 512 h
     either (hPutStrLn stderr) reportEvents $ readEventLog bs
